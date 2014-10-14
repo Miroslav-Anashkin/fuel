@@ -4,6 +4,30 @@ class osnailyfacter::cluster_ha {
 
   $primary_controller = $::fuel_settings['role'] ? { 'primary-controller'=>true, default=>false }
 
+  if $::use_monit {
+    # Configure service names for monit watchdogs and 'service' system path
+    # FIXME(bogdando) replace service_path to systemd, once supported
+    include nova::params
+    include cinder::params
+    include neutron::params
+    include l23network::params
+    $nova_compute_name   = $::nova::params::compute_service_name
+    $nova_api_name       = $::nova::params::api_service_name
+    $nova_network_name   = $::nova::params::network_service_name
+    $cinder_volume_name  = $::cinder::params::volume_service
+    $ovs_vswitchd_name   = $::l23network::params::ovs_service_name
+    case $::osfamily {
+      'RedHat' : {
+         $service_path   = '/sbin/service'
+      }
+      'Debian' : {
+        $service_path    = '/usr/sbin/service'
+      }
+      default  : {
+        fail("Unsupported osfamily: ${osfamily} for os ${operatingsystem}")
+      }
+    }
+  }
 
   if $::use_quantum {
     $novanetwork_params  = {}
@@ -214,8 +238,13 @@ class osnailyfacter::cluster_ha {
 
   if ($storage_hash['images_ceph']) {
     $glance_backend = 'ceph'
+    $glance_known_stores = [ 'glance.store.rbd.Store' ]
+  } elsif ($storage_hash['images_vcenter']) {
+    $glance_backend = 'vmware'
+    $glance_known_stores = [ 'glance.store.vmware_datastore.Store' ]
   } else {
     $glance_backend = 'swift'
+    $glance_known_stores = [ 'glance.store.swift.Store' ]
   }
 
   if ($::use_ceph) {
@@ -236,8 +265,8 @@ class osnailyfacter::cluster_ha {
     }
   }
 
-  # Use Swift if it isn't replaced by Ceph for BOTH images and objects
-  if !($storage_hash['images_ceph'] and $storage_hash['objects_ceph']) {
+  # Use Swift if it isn't replaced by vCenter, Ceph for BOTH images and objects
+  if !($storage_hash['images_ceph'] and $storage_hash['objects_ceph']) or !$storage_hash['images_vcenter'] {
     $use_swift = true
   } else {
     $use_swift = false
@@ -317,6 +346,13 @@ class osnailyfacter::cluster_ha {
       glance_db_password             => $::osnailyfacter::cluster_ha::glance_hash[db_password],
       glance_user_password           => $::osnailyfacter::cluster_ha::glance_hash[user_password],
       glance_image_cache_max_size    => $::osnailyfacter::cluster_ha::glance_hash[image_cache_max_size],
+      known_stores                   => $::osnailyfacter::cluster_ha::glance_known_stores,
+      glance_vcenter_host            => $::osnailyfacter::cluster_ha::storage_hash['vc_host'],
+      glance_vcenter_user            => $::osnailyfacter::cluster_ha::storage_hash['vc_user'],
+      glance_vcenter_password        => $::osnailyfacter::cluster_ha::storage_hash['vc_password'],
+      glance_vcenter_datacenter      => $::osnailyfacter::cluster_ha::storage_hash['vc_datacenter'],
+      glance_vcenter_datastore       => $::osnailyfacter::cluster_ha::storage_hash['vc_datastore'],
+      glance_vcenter_image_dir       => $::osnailyfacter::cluster_ha::storage_hash['vc_image_dir'],
       nova_db_password               => $::osnailyfacter::cluster_ha::nova_hash[db_password],
       nova_user_password             => $::osnailyfacter::cluster_ha::nova_hash[user_password],
       queue_provider                 => $::queue_provider,
@@ -528,9 +564,9 @@ class osnailyfacter::cluster_ha {
           sahara_keystone_user       => 'sahara',
           sahara_keystone_password   => $sahara_hash['user_password'],
           sahara_keystone_tenant     => 'services',
-
+          sahara_auth_uri            => "http://${::fuel_settings['management_vip']}:5000/v2.0/",
+          sahara_identity_uri        => "http://${::fuel_settings['management_vip']}:35357/",
           use_neutron                => $::use_quantum,
-          use_floating_ips           => $::fuel_settings['auto_assign_floating_ip'],
 
           syslog_log_facility_sahara => $syslog_log_facility_sahara,
           debug                      => $::debug,
@@ -591,7 +627,21 @@ class osnailyfacter::cluster_ha {
 
       if $murano_hash['enabled'] {
 
+        #NOTE(mattymo): Backward compatibility for Icehouse
+        case $::fuel_settings['openstack_version'] {
+          /201[1-3]\./: {
+            fail("Unsupported OpenStack version: ${::fuel_settings['openstack_version']}")
+          }
+          /2014\.1\./: {
+            $murano_package_name              = 'murano-api'
+          }
+          default: {
+            $murano_package_name              = 'murano'
+          }
+        }
+
         class { 'murano' :
+          murano_package_name      => $murano_package_name,
           murano_api_host          => $::fuel_settings['management_vip'],
 
           # Murano uses two RabbitMQ - one from OpenStack and another one installed on each controller.
@@ -638,6 +688,7 @@ class osnailyfacter::cluster_ha {
           vcenter_cluster   => $vcenter_hash['cluster'],
           use_quantum       => $::use_quantum,
           ha_mode           => true,
+          vnc_address       => $controller_node_public,
         }
       }
 
@@ -730,6 +781,41 @@ class osnailyfacter::cluster_ha {
         }
       }
 
+    # Configure monit watchdogs
+    # FIXME(bogdando) replace service_path and action to systemd, once supported
+    if $::use_monit {
+      monit::process { $nova_compute_name :
+        ensure        => running,
+        matching      => '/usr/bin/python /usr/bin/nova-compute',
+        start_command => "${service_path} ${nova_compute_name} restart",
+        stop_command  => "${service_path} ${nova_compute_name} stop",
+        pidfile       => false,
+      }
+      if $::use_quantum {
+        monit::process { $ovs_vswitchd_name :
+          ensure        => running,
+          start_command => "${service_path} ${ovs_vswitchd_name} restart",
+          stop_command  => "${service_path} ${ovs_vswitchd_name} stop",
+          pidfile       => '/var/run/openvswitch/ovs-vswitchd.pid',
+        }
+      } else {
+        monit::process { $nova_network_name :
+          ensure        => running,
+          matching      => '/usr/bin/python /usr/bin/nova-network',
+          start_command => "${service_path} ${nova_network_name} restart",
+          stop_command  => "${service_path} ${nova_network_name} stop",
+          pidfile       => false,
+        }
+        monit::process { $nova_api_name :
+          ensure        => running,
+          matching      => '/usr/bin/python /usr/bin/nova-api',
+          start_command => "${service_path} ${nova_api_name} restart",
+          stop_command  => "${service_path} ${nova_api_name} stop",
+          pidfile       => false,
+        }
+      }
+    }
+
     } # COMPUTE ENDS
 
     "mongo" : {
@@ -791,12 +877,24 @@ class osnailyfacter::cluster_ha {
         vmware_host_username => $vcenter_hash['vc_user'],
         vmware_host_password => $vcenter_hash['vc_password']
       }
+
+      # FIXME(bogdando) replace service_path and action to systemd, once supported
+      if $::use_monit {
+        monit::process { $cinder_volume_name :
+          ensure        => running,
+          matching      => '/usr/bin/python /usr/bin/cinder-volume',
+          start_command => "${service_path} ${cinder_volume_name} restart",
+          stop_command  => "${service_path} ${cinder_volume_name} stop",
+          pidfile       => false,
+        }
+      }
     } # CINDER ENDS
 
     "ceph-osd" : {
       #Class Ceph is already defined so it will do it's thing.
       notify {"ceph_osd: ${::ceph::osd_devices}": }
       notify {"osd_devices:  ${::osd_devices_list}": }
+      # TODO(bogdando) add monit ceph-osd services monitoring, if required
     } # CEPH-OSD ENDS
 
     # Definition of the first OpenStack Swift node.
@@ -837,6 +935,8 @@ class osnailyfacter::cluster_ha {
         syslog_log_facility_cinder => $syslog_log_facility_cinder,
       }
 
+      # TODO(bogdando) add monit swift-storage services monitoring, if required
+      # NOTE(bogdando) we don't deploy swift as a separate role for now, but will do
     }
 
     # Definition of OpenStack Swift proxy nodes.
@@ -867,6 +967,8 @@ class osnailyfacter::cluster_ha {
   } # ROLE CASE ENDS
 
   class { 'zabbix': }
+  # TODO(bogdando) add monit zabbix services monitoring, if required
+  # NOTE(bogdando) for nodes with pacemaker, we should use OCF instead of monit
 
 } # CLUSTER_HA ENDS
 # vim: set ts=2 sw=2 et :

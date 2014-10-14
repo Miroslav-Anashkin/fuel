@@ -48,6 +48,12 @@ class openstack::glance (
   $glance_db_user               = 'glance',
   $glance_db_dbname             = 'glance',
   $glance_backend               = 'file',
+  $glance_vcenter_host          = undef,
+  $glance_vcenter_user          = undef,
+  $glance_vcenter_password      = undef,
+  $glance_vcenter_datacenter    = undef,
+  $glance_vcenter_datastore     = undef,
+  $glance_vcenter_image_dir     = undef,
   $verbose                      = false,
   $debug                        = false,
   $enabled                      = true,
@@ -70,6 +76,7 @@ class openstack::glance (
   $rabbit_notification_topic    = 'notifications',
   $amqp_durable_queues          = false,
   $control_exchange             = 'glance',
+  $known_stores                 = false,
 ) {
   validate_string($glance_user_password)
   validate_string($glance_db_password)
@@ -101,6 +108,7 @@ class openstack::glance (
     sql_idle_timeout      => $idle_timeout,
     show_image_direct_url => true,
     pipeline              => 'keystone+cachemanagement',
+    known_stores          => $known_stores,
   }
 
   glance_api_config {
@@ -218,6 +226,7 @@ class openstack::glance (
         swift_store_user => "services:glance",
         swift_store_key=> $glance_user_password,
         swift_store_create_container_on_put => "True",
+        swift_store_large_object_size => '200',
         swift_store_auth_address => "http://${keystone_host}:5000/v2.0/"
       }
     }
@@ -226,6 +235,16 @@ class openstack::glance (
       class { "glance::backend::rbd":
         rbd_store_user => $::ceph::glance_user,
         rbd_store_pool => $::ceph::glance_pool,
+      }
+    }
+    'vmware': {
+      class { "glance::backend::vsphere":
+          vcenter_host        => $glance_vcenter_host,
+          vcenter_user        => $glance_vcenter_user,
+          vcenter_password    => $glance_vcenter_password,
+          vcenter_datacenter  => $glance_vcenter_datacenter,
+          vcenter_datastore   => $glance_vcenter_datastore,
+          vcenter_image_dir   => $glance_vcenter_image_dir,
       }
     }
     default: {
